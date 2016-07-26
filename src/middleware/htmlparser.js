@@ -15,6 +15,93 @@ function getCxAttr(node, name) {
 }
 
 function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
+  function getContent(templateVars, fragment, next) {
+
+    var hasContentConfig = config.content && config.content.server;
+    if(!hasContentConfig) { return next(null); }
+
+    var tag = getCxAttr(fragment, 'cx-content');
+    var url = config.content.server + '/' + tag;
+    var cacheKeyAttr = getCxAttr(fragment, 'cx-cache-key');
+    var cacheKey = cacheKeyAttr ? cacheKeyAttr : utils.urlToCacheKey(url);
+    var cacheTTL = utils.timeToMillis(getCxAttr(fragment, 'cx-cache-ttl') || '1m');
+
+    var opts = {
+      url: url,
+      timeout: config.content.timeout || 5000,
+      cacheKey: cacheKey,
+      cacheTTL: cacheTTL
+    };
+
+    var msg = _.template(errorTemplate);
+
+    reliableGet.get(opts, function (err, response) {
+      if (err) { return next(msg({ 'err': err.message })); }
+      var contentVars;
+      try {
+        contentVars = JSON.parse(response.content)
+      } catch (e) {
+        contentVars = {};
+      }
+      _.each(contentVars, function (value, key) {
+        templateVars['content:' + tag + ':' + key] = value;
+        templateVars['content:' + tag + ':' + key + ':encoded'] = encodeURI(value);
+      });
+      next(null, '<!-- content ' + tag + ' loaded -->');
+    });
+  }
+
+  function dealWithStats (req, err) {
+    if (err && err.statistics && config.functions && config.functions.statisticsHandler) {
+      // Send stats to the stats handler if it is defined
+      config.functions.statisticsHandler(req.backend, err.statistics);
+    }
+  }
+
+  function setResponseHeaders (res, headers) {
+    if (res.headersSent) { return; } // ignore late joiners
+    var hasCacheControl = function (headers, value) {
+      if (typeof value === 'undefined') { return headers['cache-control']; }
+      return (headers['cache-control'] || '').indexOf(value) !== -1;
+    }
+    // A fragment is telling us to not cache it. We force the entire backend/composed page to not be cached.
+    if (hasCacheControl(headers, 'no-cache') || hasCacheControl(headers, 'no-store')) {
+      // Use the fragment's cache-control header only if we don't already have one from the backend, or
+      // it does not have no-cache or no-store.
+      var backendCacheControl = res.getHeader('cache-control');
+      if (!backendCacheControl || !(hasCacheControl({ 'cache-control': backendCacheControl }, 'no-cache') ||
+        hasCacheControl({ 'cache-control': backendCacheControl }, 'no-store'))) {
+        res.setHeader('cache-control', 'no-cache, no-store, must-revalidate');
+      }
+    }
+    if (headers['set-cookie']) {
+      var existingResponseCookies = res.getHeader('set-cookie') || [];
+      res.setHeader('set-cookie', _.union(existingResponseCookies, headers['set-cookie']));
+    }
+  }
+
+  function logError (err, message, req, ignoreError) {
+    var logLevel = err.statusCode === 404 || ignoreError ? 'warn' : 'error';
+    eventHandler.logger(logLevel, message, {
+      tracer: req.tracer
+    });
+  }
+
+  function delimitContent (response, options) {
+    var id = _.uniqueId();
+    var data = {
+      options: options,
+      status: response.statusCode,
+      timing: response.timing,
+    };
+    var open_tag = debugScriptTag({ data: data, id: id, type: 'open' });
+    var close_tag = debugScriptTag({ data: null, id: id, type: 'close' });
+    return open_tag + response.content + close_tag;
+  }
+
+  function isDebugEnabled (req) {
+    return req.query && req.query['cx-debug'];
+  }
 
   return function (req, res, next) {
 
@@ -36,7 +123,7 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
           parxerPlugins.Url(getCx.bind(this, newDepth)),
           parxerPlugins.Image(),
           parxerPlugins.Bundle(getCx.bind(this, newDepth)),
-          parxerPlugins.Content(getContent),
+          parxerPlugins.Content(getContent.bind(this, templateVars)),
           parxerPlugins.ContentItem
         ],
         variables: templateVars
@@ -88,32 +175,10 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
         statsdKey: statsdKey
       }
 
-      var setResponseHeaders = function (headers) {
-        if (res.headersSent) { return; } // ignore late joiners
-        var hasCacheControl = function (headers, value) {
-          if (typeof value === 'undefined') { return headers['cache-control']; }
-          return (headers['cache-control'] || '').indexOf(value) !== -1;
-        }
-        // A fragment is telling us to not cache it. We force the entire backend/composed page to not be cached.
-        if (hasCacheControl(headers, 'no-cache') || hasCacheControl(headers, 'no-store')) {
-          // Use the fragment's cache-control header only if we don't already have one from the backend, or
-          // it does not have no-cache or no-store.
-          var backendCacheControl = res.getHeader('cache-control');
-          if (!backendCacheControl || !(hasCacheControl({ 'cache-control': backendCacheControl }, 'no-cache') ||
-            hasCacheControl({ 'cache-control': backendCacheControl }, 'no-store'))) {
-            res.setHeader('cache-control', 'no-cache, no-store, must-revalidate');
-          }
-        }
-        if (headers['set-cookie']) {
-          var existingResponseCookies = res.getHeader('set-cookie') || [];
-          res.setHeader('set-cookie', _.union(existingResponseCookies, headers['set-cookie']));
-        }
-      }
-
       var responseCallback = function (err, content, headers) {
         if (headers) {
           utils.updateTemplateVariables(templateVars, headers);
-          setResponseHeaders(headers);
+          setResponseHeaders(res, headers);
         }
 
         if (err || !content) {
@@ -137,13 +202,6 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
         });
       };
 
-      var logError = function (err, message, ignoreError) {
-        var logLevel = err.statusCode === 404 || ignoreError ? 'warn' : 'error';
-        eventHandler.logger(logLevel, message, {
-          tracer: req.tracer
-        });
-      }
-
       var onErrorHandler = function (err, oldCacheData, transformedOptions) {
 
         var errorMsg, elapsed = Date.now() - req.timerStart, timing = Date.now() - start, msg = _.template(errorTemplate);
@@ -155,7 +213,7 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
             url: transformedOptions.url,
             cacheKey: transformedOptions.cacheKey,
             statusCode: err.statusCode
-          }), true);
+          }), req, true);
           return responseCallback(msg({ 'err': err.message }));
         }
 
@@ -169,23 +227,20 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
         }
 
         if (err.statusCode === 404 && !transformedOptions.ignore404) {
-
           errorMsg = _.template('404 Service <%= url %> cache <%= cacheKey %> returned 404.');
 
-          logError(err, errorMsg({ url: transformedOptions.url, cacheKey: transformedOptions.cacheKey }));
+          logError(err, errorMsg({ url: transformedOptions.url, cacheKey: transformedOptions.cacheKey }), req);
 
           if (!res.headersSent) {
             res.writeHead(404, { 'Content-Type': 'text/html' });
             return res.end(errorMsg(transformedOptions));
           }
-
         } else {
-
           if (oldCacheData && oldCacheData.content) {
             responseCallback(msg({ 'err': err.message }), oldCacheData.content, oldCacheData.headers);
             //debugMode.add(transformedOptions.unparsedUrl, {status: 'ERROR', httpStatus: err.statusCode, staleContent: true, timing: timing });
             errorMsg = _.template('STALE <%= url %> cache <%= cacheKey %> failed but serving stale content.');
-            logError(err, errorMsg(transformedOptions));
+            logError(err, errorMsg(transformedOptions), req);
           } else {
             //debugMode.add(transformedOptions.unparsedUrl, {status: 'ERROR', httpStatus: err.statusCode, defaultContent: true, timing: timing });
             responseCallback(msg({ 'err': err.message }));
@@ -193,26 +248,8 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
 
           eventHandler.stats('increment', transformedOptions.statsdKey + '.error');
           errorMsg = _.template('FAIL <%= url %> did not respond in <%= timing%>, elapsed <%= elapsed %>. Reason: ' + err.message);
-          logError(err, errorMsg({ url: transformedOptions.url, timing: timing, elapsed: elapsed }));
-
+          logError(err, errorMsg({ url: transformedOptions.url, timing: timing, elapsed: elapsed }), req);
         }
-
-      };
-
-      var isDebugEnabled = function () {
-        return req.query && req.query['cx-debug'];
-      };
-
-      var delimitContent = function (response, options) {
-        var id = _.uniqueId();
-        var data = {
-          options: options,
-          status: response.statusCode,
-          timing: response.timing,
-        };
-        var open_tag = debugScriptTag({ data: data, id: id, type: 'open' });
-        var close_tag = debugScriptTag({ data: null, id: id, type: 'close' });
-        return open_tag + response.content + close_tag;
       };
 
       optionsTransformer(req, options, function (err, transformedOptions) {
@@ -223,54 +260,10 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
             return onErrorHandler(err, response, transformedOptions);
           }
           fragmentTimings.push({ url: options.url, status: response.statusCode, timing: response.timing });
-          content = isDebugEnabled() ? delimitContent(response, options) : response.content;
+          content = isDebugEnabled(req) ? delimitContent(response, options) : response.content;
           responseCallback(null, content, response.headers);
         });
       });
-
-    }
-
-    function getContent(fragment, next) {
-
-      var hasContentConfig = config.content && config.content.server;
-      if(!hasContentConfig) { return next(null); }
-
-      var tag = getCxAttr(fragment, 'cx-content');
-      var url = config.content.server + '/' + tag;
-      var cacheKeyAttr = getCxAttr(fragment, 'cx-cache-key');
-      var cacheKey = cacheKeyAttr ? cacheKeyAttr : utils.urlToCacheKey(url);
-      var cacheTTL = utils.timeToMillis(getCxAttr(fragment, 'cx-cache-ttl') || '1m');
-
-      var opts = {
-        url: url,
-        timeout: config.content.timeout || 5000,
-        cacheKey: cacheKey,
-        cacheTTL: cacheTTL
-      };
-
-      var msg = _.template(errorTemplate);
-
-      reliableGet.get(opts, function (err, response) {
-        if (err) { return next(msg({ 'err': err.message })); }
-        var contentVars;
-        try {
-          contentVars = JSON.parse(response.content)
-        } catch (e) {
-          contentVars = {};
-        }
-        _.each(contentVars, function (value, key) {
-          templateVars['content:' + tag + ':' + key] = value;
-          templateVars['content:' + tag + ':' + key + ':encoded'] = encodeURI(value);
-        });
-        next(null, '<!-- content ' + tag + ' loaded -->');
-      });
-    }
-
-    var dealWithStats = function (err) {
-      if (err && err.statistics && config.functions && config.functions.statisticsHandler) {
-        // Send stats to the stats handler if it is defined
-        config.functions.statisticsHandler(req.backend, err.statistics);
-      }
     }
 
     res.parse = function (data) {
@@ -285,7 +278,7 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
           // TODO: Notify fragment errors to debugger in future
         }
 
-        dealWithStats(err);
+        dealWithStats(req, err);
 
         if (!res.headersSent) {
           if (req.query && req.query['cx-debug']) {
@@ -307,9 +300,7 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
     };
 
     next();
-
   }
-
 }
 
 
