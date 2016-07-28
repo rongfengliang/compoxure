@@ -14,8 +14,60 @@ function getCxAttr(node, name) {
   return value && htmlEntities.decode(value);
 }
 
+function isDebugEnabled (req) {
+  return req.query && req.query['cx-debug'];
+}
+
+function setResponseHeaders (res, headers) {
+  if (res.headersSent) { return; } // ignore late joiners
+  var hasCacheControl = function (headers, value) {
+    if (typeof value === 'undefined') { return headers['cache-control']; }
+    return (headers['cache-control'] || '').indexOf(value) !== -1;
+  }
+  // A fragment is telling us to not cache it. We force the entire backend/composed page to not be cached.
+  if (hasCacheControl(headers, 'no-cache') || hasCacheControl(headers, 'no-store')) {
+    // Use the fragment's cache-control header only if we don't already have one from the backend, or
+    // it does not have no-cache or no-store.
+    var backendCacheControl = res.getHeader('cache-control');
+    if (!backendCacheControl || !(hasCacheControl({ 'cache-control': backendCacheControl }, 'no-cache') ||
+      hasCacheControl({ 'cache-control': backendCacheControl }, 'no-store'))) {
+      res.setHeader('cache-control', 'no-cache, no-store, must-revalidate');
+    }
+  }
+  if (headers['set-cookie']) {
+    var existingResponseCookies = res.getHeader('set-cookie') || [];
+    res.setHeader('set-cookie', _.union(existingResponseCookies, headers['set-cookie']));
+  }
+}
+
+function delimitContent (response, options) {
+  var id = _.uniqueId();
+  var data = {
+    options: options,
+    status: response.statusCode,
+    timing: response.timing,
+  };
+  var open_tag = debugScriptTag({ data: data, id: id, type: 'open' });
+  var close_tag = debugScriptTag({ data: null, id: id, type: 'close' });
+  return open_tag + response.content + close_tag;
+}
+
 function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
-  function getContent(templateVars, fragment, next) {
+  function dealWithStats (req, err) {
+    if (err && err.statistics && config.functions && config.functions.statisticsHandler) {
+      // Send stats to the stats handler if it is defined
+      config.functions.statisticsHandler(req.backend, err.statistics);
+    }
+  }
+
+  function logError (err, message, req, ignoreError) {
+    var logLevel = err.statusCode === 404 || ignoreError ? 'warn' : 'error';
+    eventHandler.logger(logLevel, message, {
+      tracer: req.tracer
+    });
+  }
+
+  var getContent = _.curry(function (templateVars, fragment, next) {
 
     var hasContentConfig = config.content && config.content.server;
     if(!hasContentConfig) { return next(null); }
@@ -49,225 +101,174 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
       });
       next(null, '<!-- content ' + tag + ' loaded -->');
     });
-  }
+  });
 
-  function dealWithStats (req, err) {
-    if (err && err.statistics && config.functions && config.functions.statisticsHandler) {
-      // Send stats to the stats handler if it is defined
-      config.functions.statisticsHandler(req.backend, err.statistics);
-    }
-  }
+  var getCx = _.curry(function (req, res, parse, templateVars, fragmentTimings, depth, fragment, next) {
+    /*jslint evil: true */
+    var options,
+      start = Date.now(),
+      url = getCxAttr(fragment, 'cx-url'),
+      timeout = utils.timeToMillis(getCxAttr(fragment, 'cx-timeout') || '5s'),
+      cacheKeyAttr = getCxAttr(fragment, 'cx-cache-key'),
+      cacheKey = cacheKeyAttr ? cacheKeyAttr : utils.urlToCacheKey(url),
+      cacheTTL = utils.timeToMillis(getCxAttr(fragment, 'cx-cache-ttl') || '1m'),
+      explicitNoCacheAttr = getCxAttr(fragment, 'cx-no-cache'),
+      explicitNoCache = req.explicitNoCache || (explicitNoCacheAttr ? eval(explicitNoCacheAttr) : false),
+      ignore404 = (getCxAttr(fragment, 'cx-ignore-404') || 'true') === 'true',
+      ignoreError = getCxAttr(fragment, 'cx-ignore-error'),
+      statsdKey = 'fragment_' + (getCxAttr(fragment, 'cx-statsd-key') || 'unknown'),
+      accept = getCxAttr(fragment, 'cx-accept') || 'text/html',
+      optionsHeaders = {
+        'accept': accept,
+        'cx-page-url': templateVars['url:href'],
+        'x-tracer': req.tracer
+      };
 
-  function setResponseHeaders (res, headers) {
-    if (res.headersSent) { return; } // ignore late joiners
-    var hasCacheControl = function (headers, value) {
-      if (typeof value === 'undefined') { return headers['cache-control']; }
-      return (headers['cache-control'] || '').indexOf(value) !== -1;
+    if (req.cookies && req.headers.cookie) {
+      var whitelist = config.cookies && config.cookies.whitelist;
+      optionsHeaders.cookie = whitelist ? utils.filterCookies(whitelist, req.cookies) : req.headers.cookie;
     }
-    // A fragment is telling us to not cache it. We force the entire backend/composed page to not be cached.
-    if (hasCacheControl(headers, 'no-cache') || hasCacheControl(headers, 'no-store')) {
-      // Use the fragment's cache-control header only if we don't already have one from the backend, or
-      // it does not have no-cache or no-store.
-      var backendCacheControl = res.getHeader('cache-control');
-      if (!backendCacheControl || !(hasCacheControl({ 'cache-control': backendCacheControl }, 'no-cache') ||
-        hasCacheControl({ 'cache-control': backendCacheControl }, 'no-store'))) {
-        res.setHeader('cache-control', 'no-cache, no-store, must-revalidate');
+    if (config.cdn) {
+      if (config.cdn.host) { optionsHeaders['x-cdn-host'] = config.cdn.host; }
+      if (config.cdn.url) { optionsHeaders['x-cdn-url'] = config.cdn.url; }
+    }
+
+    options = {
+      url: url,
+      timeout: timeout,
+      cacheKey: cacheKey,
+      cacheTTL: cacheTTL,
+      explicitNoCache: explicitNoCache,
+      ignore404: ignore404,
+      type: 'fragment',
+      headers: optionsHeaders,
+      tracer: req.tracer,
+      statsdKey: statsdKey
+    }
+
+    var responseCallback = function (err, content, headers) {
+      if (headers) {
+        utils.updateTemplateVariables(templateVars, headers);
+        setResponseHeaders(res, headers);
       }
-    }
-    if (headers['set-cookie']) {
-      var existingResponseCookies = res.getHeader('set-cookie') || [];
-      res.setHeader('set-cookie', _.union(existingResponseCookies, headers['set-cookie']));
-    }
-  }
 
-  function logError (err, message, req, ignoreError) {
-    var logLevel = err.statusCode === 404 || ignoreError ? 'warn' : 'error';
-    eventHandler.logger(logLevel, message, {
-      tracer: req.tracer
-    });
-  }
+      if (err || !content) {
+        return next(err, content, headers);
+      }
 
-  function delimitContent (response, options) {
-    var id = _.uniqueId();
-    var data = {
-      options: options,
-      status: response.statusCode,
-      timing: response.timing,
+      if (depth > (config.fragmentDepth || 5)) {
+        return next(err, content, headers);
+      }
+
+      if (!headers || ! headers['cx-parse-me']) {
+        return next(err, content, headers);
+      }
+
+      parse(content, depth, function (err, fragmentCount, newDepth, newContent) {
+        if (err && err.content) {
+          return next(err, content, headers);
+        }
+
+        return next(null, newContent, headers);
+      });
     };
-    var open_tag = debugScriptTag({ data: data, id: id, type: 'open' });
-    var close_tag = debugScriptTag({ data: null, id: id, type: 'close' });
-    return open_tag + response.content + close_tag;
-  }
 
-  function isDebugEnabled (req) {
-    return req.query && req.query['cx-debug'];
-  }
+    var onErrorHandler = function (err, oldCacheData, transformedOptions) {
+
+      var errorMsg, elapsed = Date.now() - req.timerStart, timing = Date.now() - start, msg = _.template(errorTemplate);
+
+      // Check to see if we are just ignoring errors completely for this fragment
+      if (ignoreError && (ignoreError === 'true' || _.contains(ignoreError.split(','), '' + err.statusCode))) {
+        errorMsg = _.template('IGNORE <%= statusCode %> for Service <%= url %> cache <%= cacheKey %>.');
+        logError(err, errorMsg({
+          url: transformedOptions.url,
+          cacheKey: transformedOptions.cacheKey,
+          statusCode: err.statusCode
+        }), req, true);
+        return responseCallback(msg({ 'err': err.message }));
+      }
+
+      // Check to see if we have any statusCode handlers defined
+      if (err.statusCode && config.statusCodeHandlers && config.statusCodeHandlers[err.statusCode]) {
+        var handlerDefn = config.statusCodeHandlers[err.statusCode];
+        var handlerFn = config.functions && config.functions[handlerDefn.fn];
+        if (handlerFn) {
+          return handlerFn(req, res, req.templateVars, handlerDefn.data, transformedOptions, err, responseCallback);
+        }
+      }
+
+      if (err.statusCode === 404 && !transformedOptions.ignore404) {
+        errorMsg = _.template('404 Service <%= url %> cache <%= cacheKey %> returned 404.');
+
+        logError(err, errorMsg({ url: transformedOptions.url, cacheKey: transformedOptions.cacheKey }), req);
+
+        if (!res.headersSent) {
+          res.writeHead(404, { 'Content-Type': 'text/html' });
+          return res.end(errorMsg(transformedOptions));
+        }
+      } else {
+        if (oldCacheData && oldCacheData.content) {
+          responseCallback(msg({ 'err': err.message }), oldCacheData.content, oldCacheData.headers);
+          //debugMode.add(transformedOptions.unparsedUrl, {status: 'ERROR', httpStatus: err.statusCode, staleContent: true, timing: timing });
+          errorMsg = _.template('STALE <%= url %> cache <%= cacheKey %> failed but serving stale content.');
+          logError(err, errorMsg(transformedOptions), req);
+        } else {
+          //debugMode.add(transformedOptions.unparsedUrl, {status: 'ERROR', httpStatus: err.statusCode, defaultContent: true, timing: timing });
+          responseCallback(msg({ 'err': err.message }));
+        }
+
+        eventHandler.stats('increment', transformedOptions.statsdKey + '.error');
+        errorMsg = _.template('FAIL <%= url %> did not respond in <%= timing%>, elapsed <%= elapsed %>. Reason: ' + err.message);
+        logError(err, errorMsg({ url: transformedOptions.url, timing: timing, elapsed: elapsed }), req);
+      }
+    };
+
+    optionsTransformer(req, options, function (err, transformedOptions) {
+      if (err) { return onErrorHandler(err, {}, transformedOptions); }
+      reliableGet.get(transformedOptions, function (err, response) {
+        var content;
+        if (err) {
+          return onErrorHandler(err, response, transformedOptions);
+        }
+        fragmentTimings.push({ url: options.url, status: response.statusCode, timing: response.timing });
+        content = isDebugEnabled(req) ? delimitContent(response, options) : response.content;
+        responseCallback(null, content, response.headers);
+      });
+    });
+  });
+
+  var parse = _.curry(function (req, res, templateVars, fragmentTimings, data, depth, callback) {
+    var newDepth = depth + 1;
+
+    parxer({
+      environment: config.environment,
+      cdn: config.cdn,
+      minified: config.minified,
+      showErrors: !req.backend.quietFailure,
+      timeout: utils.timeToMillis(req.backend.timeout || '5000'),
+      plugins: [
+        parxerPlugins.Test,
+        parxerPlugins.If,
+        parxerPlugins.Url(getCx(req, res, parse(req, res, templateVars, fragmentTimings), templateVars, fragmentTimings, newDepth)),
+        parxerPlugins.Image(),
+        parxerPlugins.Bundle(getCx(req, res, parse(req, res, templateVars, fragmentTimings), templateVars, fragmentTimings, newDepth)),
+        parxerPlugins.Content(getContent(templateVars)),
+        parxerPlugins.ContentItem
+      ],
+      variables: templateVars
+    }, data, function (err, fragmentCount, content) {
+      callback(err, fragmentCount, newDepth, content);
+    });
+  });
 
   return function (req, res, next) {
 
     var templateVars = req.templateVars;
     var fragmentTimings = [];
-
-    var parse = function (data, depth, callback) {
-      var newDepth = depth + 1;
-
-      parxer({
-        environment: config.environment,
-        cdn: config.cdn,
-        minified: config.minified,
-        showErrors: !req.backend.quietFailure,
-        timeout: utils.timeToMillis(req.backend.timeout || '5000'),
-        plugins: [
-          parxerPlugins.Test,
-          parxerPlugins.If,
-          parxerPlugins.Url(getCx.bind(this, newDepth)),
-          parxerPlugins.Image(),
-          parxerPlugins.Bundle(getCx.bind(this, newDepth)),
-          parxerPlugins.Content(getContent.bind(this, templateVars)),
-          parxerPlugins.ContentItem
-        ],
-        variables: templateVars
-      }, data, function (err, fragmentCount, content) {
-        callback(err, fragmentCount, newDepth, content);
-      });
-    };
-
-    function getCx(depth, fragment, next) {
-      /*jslint evil: true */
-      var options,
-        start = Date.now(),
-        url = getCxAttr(fragment, 'cx-url'),
-        timeout = utils.timeToMillis(getCxAttr(fragment, 'cx-timeout') || '5s'),
-        cacheKeyAttr = getCxAttr(fragment, 'cx-cache-key'),
-        cacheKey = cacheKeyAttr ? cacheKeyAttr : utils.urlToCacheKey(url),
-        cacheTTL = utils.timeToMillis(getCxAttr(fragment, 'cx-cache-ttl') || '1m'),
-        explicitNoCacheAttr = getCxAttr(fragment, 'cx-no-cache'),
-        explicitNoCache = req.explicitNoCache || (explicitNoCacheAttr ? eval(explicitNoCacheAttr) : false),
-        ignore404 = (getCxAttr(fragment, 'cx-ignore-404') || 'true') === 'true',
-        ignoreError = getCxAttr(fragment, 'cx-ignore-error'),
-        statsdKey = 'fragment_' + (getCxAttr(fragment, 'cx-statsd-key') || 'unknown'),
-        accept = getCxAttr(fragment, 'cx-accept') || 'text/html',
-        optionsHeaders = {
-          'accept': accept,
-          'cx-page-url': templateVars['url:href'],
-          'x-tracer': req.tracer
-        };
-
-      if (req.cookies && req.headers.cookie) {
-        var whitelist = config.cookies && config.cookies.whitelist;
-        optionsHeaders.cookie = whitelist ? utils.filterCookies(whitelist, req.cookies) : req.headers.cookie;
-      }
-      if (config.cdn) {
-        if (config.cdn.host) { optionsHeaders['x-cdn-host'] = config.cdn.host; }
-        if (config.cdn.url) { optionsHeaders['x-cdn-url'] = config.cdn.url; }
-      }
-
-      options = {
-        url: url,
-        timeout: timeout,
-        cacheKey: cacheKey,
-        cacheTTL: cacheTTL,
-        explicitNoCache: explicitNoCache,
-        ignore404: ignore404,
-        type: 'fragment',
-        headers: optionsHeaders,
-        tracer: req.tracer,
-        statsdKey: statsdKey
-      }
-
-      var responseCallback = function (err, content, headers) {
-        if (headers) {
-          utils.updateTemplateVariables(templateVars, headers);
-          setResponseHeaders(res, headers);
-        }
-
-        if (err || !content) {
-          return next(err, content, headers);
-        }
-
-        if (depth > (config.fragmentDepth || 5)) {
-          return next(err, content, headers);
-        }
-
-        if (!headers || ! headers['cx-parse-me']) {
-          return next(err, content, headers);
-        }
-
-        parse(content, depth, function (err, fragmentCount, newDepth, newContent) {
-          if (err && err.content) {
-            return next(err, content, headers);
-          }
-
-          return next(null, newContent, headers);
-        });
-      };
-
-      var onErrorHandler = function (err, oldCacheData, transformedOptions) {
-
-        var errorMsg, elapsed = Date.now() - req.timerStart, timing = Date.now() - start, msg = _.template(errorTemplate);
-
-        // Check to see if we are just ignoring errors completely for this fragment
-        if (ignoreError && (ignoreError === 'true' || _.contains(ignoreError.split(','), '' + err.statusCode))) {
-          errorMsg = _.template('IGNORE <%= statusCode %> for Service <%= url %> cache <%= cacheKey %>.');
-          logError(err, errorMsg({
-            url: transformedOptions.url,
-            cacheKey: transformedOptions.cacheKey,
-            statusCode: err.statusCode
-          }), req, true);
-          return responseCallback(msg({ 'err': err.message }));
-        }
-
-        // Check to see if we have any statusCode handlers defined
-        if (err.statusCode && config.statusCodeHandlers && config.statusCodeHandlers[err.statusCode]) {
-          var handlerDefn = config.statusCodeHandlers[err.statusCode];
-          var handlerFn = config.functions && config.functions[handlerDefn.fn];
-          if (handlerFn) {
-            return handlerFn(req, res, req.templateVars, handlerDefn.data, transformedOptions, err, responseCallback);
-          }
-        }
-
-        if (err.statusCode === 404 && !transformedOptions.ignore404) {
-          errorMsg = _.template('404 Service <%= url %> cache <%= cacheKey %> returned 404.');
-
-          logError(err, errorMsg({ url: transformedOptions.url, cacheKey: transformedOptions.cacheKey }), req);
-
-          if (!res.headersSent) {
-            res.writeHead(404, { 'Content-Type': 'text/html' });
-            return res.end(errorMsg(transformedOptions));
-          }
-        } else {
-          if (oldCacheData && oldCacheData.content) {
-            responseCallback(msg({ 'err': err.message }), oldCacheData.content, oldCacheData.headers);
-            //debugMode.add(transformedOptions.unparsedUrl, {status: 'ERROR', httpStatus: err.statusCode, staleContent: true, timing: timing });
-            errorMsg = _.template('STALE <%= url %> cache <%= cacheKey %> failed but serving stale content.');
-            logError(err, errorMsg(transformedOptions), req);
-          } else {
-            //debugMode.add(transformedOptions.unparsedUrl, {status: 'ERROR', httpStatus: err.statusCode, defaultContent: true, timing: timing });
-            responseCallback(msg({ 'err': err.message }));
-          }
-
-          eventHandler.stats('increment', transformedOptions.statsdKey + '.error');
-          errorMsg = _.template('FAIL <%= url %> did not respond in <%= timing%>, elapsed <%= elapsed %>. Reason: ' + err.message);
-          logError(err, errorMsg({ url: transformedOptions.url, timing: timing, elapsed: elapsed }), req);
-        }
-      };
-
-      optionsTransformer(req, options, function (err, transformedOptions) {
-        if (err) { return onErrorHandler(err, {}, transformedOptions); }
-        reliableGet.get(transformedOptions, function (err, response) {
-          var content;
-          if (err) {
-            return onErrorHandler(err, response, transformedOptions);
-          }
-          fragmentTimings.push({ url: options.url, status: response.statusCode, timing: response.timing });
-          content = isDebugEnabled(req) ? delimitContent(response, options) : response.content;
-          responseCallback(null, content, response.headers);
-        });
-      });
-    }
+    var startDepth = 0;
 
     res.parse = function (data) {
-      parse(data, 0, function (err, fragmentIndex, depth, content) {
+      parse(req, res, templateVars, fragmentTimings, data, startDepth, function (err, fragmentIndex, depth, content) {
         // Overall errors
         if (err && err.content && !res.headersSent) {
           res.writeHead(err.statusCode || 500, { 'Content-Type': 'text/html' });
@@ -281,10 +282,9 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
         dealWithStats(req, err);
 
         if (!res.headersSent) {
-          if (req.query && req.query['cx-debug']) {
+          if (isDebugEnabled(req)) {
             content = content.replace('</body>', debugScript + '</body>');
           }
-
 
           if (err && err.content && !res.headersSent) {
             res.writeHead(err.statusCode || 500, { 'Content-Type': 'text/html' });

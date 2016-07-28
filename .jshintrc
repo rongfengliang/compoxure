@@ -2,7 +2,7 @@
   "node": true,
   "asi": true,
   "curly": true,
-  "latedef": false,
+  "latedef": true,
   "quotmark": true,
   "undef": true,
   "unused": true,
