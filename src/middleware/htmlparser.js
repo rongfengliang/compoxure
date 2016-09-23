@@ -60,11 +60,19 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
     }
   }
 
-  function logError (err, message, req, ignoreError) {
-    var logLevel = err.statusCode === 404 || ignoreError ? 'warn' : 'error';
-    eventHandler.logger(logLevel, message, {
-      tracer: req.tracer
-    });
+  function logError (err, message, req, options) {
+    if (! options) {
+      options = {};
+    }
+
+    var logLevel = err.statusCode === 404 || options.ignoreError ? 'warn' : 'error';
+    var loggerData = _.defaults({}, {
+      tracer: req.tracer,
+      backend: _.pick(req.backend, ['target', 'name', 'ttl', 'cacheKey', 'timeout']),
+      pageUrl: req.url,
+    }, options.data);
+
+    eventHandler.logger(logLevel, message, loggerData);
   }
 
   var getContent = _.curry(function (templateVars, fragment, next) {
@@ -176,15 +184,24 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
     var onErrorHandler = function (err, oldCacheData, transformedOptions) {
 
       var errorMsg, elapsed = Date.now() - req.timerStart, timing = Date.now() - start, msg = _.template(errorTemplate);
+      var logData =  {
+        fragmentUrl: transformedOptions.url,
+        fragmentCacheKey: transformedOptions.cacheKey,
+        fragmentStatusCode: err.statusCode,
+      };
 
       // Check to see if we are just ignoring errors completely for this fragment
       if (ignoreError && (ignoreError === 'true' || _.contains(ignoreError.split(','), '' + err.statusCode))) {
         errorMsg = _.template('IGNORE <%= statusCode %> for Service <%= url %> cache <%= cacheKey %>.');
         logError(err, errorMsg({
-          url: transformedOptions.url,
-          cacheKey: transformedOptions.cacheKey,
-          statusCode: err.statusCode
-        }), req, true);
+            url: transformedOptions.url,
+            cacheKey: transformedOptions.cacheKey,
+            statusCode: err.statusCode
+          }), req, {
+            ignoreError: true,
+            data: logData,
+          }
+        );
         return responseCallback(msg({ 'err': err.message }));
       }
 
@@ -200,7 +217,7 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
       if (err.statusCode === 404 && !transformedOptions.ignore404) {
         errorMsg = _.template('404 Service <%= url %> cache <%= cacheKey %> returned 404.');
 
-        logError(err, errorMsg({ url: transformedOptions.url, cacheKey: transformedOptions.cacheKey }), req);
+        logError(err, errorMsg({ url: transformedOptions.url, cacheKey: transformedOptions.cacheKey }), req, { data: logData });
 
         if (!res.headersSent) {
           res.writeHead(404, { 'Content-Type': 'text/html' });
@@ -211,7 +228,7 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
           responseCallback(msg({ 'err': err.message }), oldCacheData.content, oldCacheData.headers);
           //debugMode.add(transformedOptions.unparsedUrl, {status: 'ERROR', httpStatus: err.statusCode, staleContent: true, timing: timing });
           errorMsg = _.template('STALE <%= url %> cache <%= cacheKey %> failed but serving stale content.');
-          logError(err, errorMsg(transformedOptions), req);
+          logError(err, errorMsg(transformedOptions), req, { data: logData });
         } else {
           //debugMode.add(transformedOptions.unparsedUrl, {status: 'ERROR', httpStatus: err.statusCode, defaultContent: true, timing: timing });
           responseCallback(msg({ 'err': err.message }));
@@ -219,7 +236,7 @@ function getMiddleware(config, reliableGet, eventHandler, optionsTransformer) {
 
         eventHandler.stats('increment', transformedOptions.statsdKey + '.error');
         errorMsg = _.template('FAIL <%= url %> did not respond in <%= timing%>, elapsed <%= elapsed %>. Reason: ' + err.message);
-        logError(err, errorMsg({ url: transformedOptions.url, timing: timing, elapsed: elapsed }), req);
+        logError(err, errorMsg({ url: transformedOptions.url, timing: timing, elapsed: elapsed }), req, { data: logData });
       }
     };
 
